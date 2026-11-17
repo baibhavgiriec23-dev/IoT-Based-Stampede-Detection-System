@@ -1,0 +1,544 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <HX711.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+#include "driver/i2s.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <math.h>
+
+// =====================================================
+// STAMPEDE DETECTOR - ESP32 HOSTED DASHBOARD + CII
+// LoRa is intentionally disabled in this version.
+// =====================================================
+
+// Enter your 2.4 GHz Wi-Fi credentials here.
+const char* WIFI_SSID = "iQOO NEO 7 PRO";
+const char* WIFI_PASSWORD = "12345678";
+
+// ---------------- PIN CONFIGURATION -----------------
+#define HX_DOUT 32
+#define HX_SCK  33
+
+#define ADXL_SDA 21
+#define ADXL_SCL 22
+
+#define I2S_PORT I2S_NUM_0
+#define MIC_BCLK 26
+#define MIC_WS   25
+#define MIC_SD   34
+
+#define SAMPLE_RATE 16000
+#define SAMPLE_COUNT 512
+
+// ---------------- DETECTION SETTINGS -----------------
+#define LOAD_THRESHOLD 10000L
+#define VIBRATION_THRESHOLD 1.0f
+#define SOUND_THRESHOLD_DB 8.0f
+#define MIN_SOUND_DBFS -55.0f
+#define REQUIRED_READINGS 3
+
+// ---------------- CII NORMALIZATION ------------------
+// Each component is mapped to 0..100 before applying
+// the user's weighted CII formula.
+// P: absolute HX711 count change / LOAD_THRESHOLD
+// V: vibration change / VIBRATION_THRESHOLD
+// S: sound increase / SOUND_THRESHOLD_DB
+// dP and dV: absolute change in P and V since last update.
+// These are prototype normalization choices, not validated
+// crowd-density or stampede-prediction calibration.
+
+HX711 scale;
+Adafruit_ADXL345_Unified adxl(12345);
+WebServer server(80);
+
+bool hxOK = false, adxlOK = false, micOK = false;
+bool currentLoadValid = false;
+bool loadBaselineOK = false, accelBaselineOK = false, micBaselineOK = false;
+
+long loadBaseline = 0, currentLoad = 0, loadDifference = 0;
+float demoLoadKg = 0.0f;
+
+float ax = 0, ay = 0, az = 0;
+float vibrationRMS = 0, vibrationBaseline = 0, vibrationChange = 0;
+
+float soundBaseline = -120.0f, currentSound = -120.0f, soundIncrease = 0;
+
+bool loadAlert = false, vibrationAlert = false, soundAlert = false;
+int loadCount = 0, vibrationCount = 0, soundCount = 0;
+int loadClearCount = 0, vibrationClearCount = 0;
+unsigned long soundLastDetected = 0;
+unsigned long lastDisplay = 0, lastDemoUpdate = 0, lastCiiUpdate = 0;
+unsigned long readingNumber = 0;
+
+float P = 0, V = 0, S = 0, dP = 0, dV = 0, CII = 0;
+float previousP = 0, previousV = 0;
+bool ciiInitialized = false;
+
+// ---------------- DASHBOARD HTML ---------------------
+const char DASHBOARD_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stampede Detector | Node 1</title>
+<style>
+:root{--bg:#08111f;--panel:#14243a;--line:#29435f;--cyan:#51c8ff;--muted:#9eb2c9;--white:#edf5ff}
+*{box-sizing:border-box}
+body{margin:0;padding:22px;background:linear-gradient(135deg,#07101d,#14243a);font-family:Arial,sans-serif;color:var(--white)}
+.wrap{max-width:1150px;margin:auto}
+header{text-align:center;margin-bottom:22px}
+h1{margin:5px;color:var(--cyan);letter-spacing:1.5px}
+.sub{color:var(--muted);font-size:13px}
+.top{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;margin:16px 0}
+.pill{background:var(--panel);border:1px solid var(--line);padding:10px 15px;border-radius:30px;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 8px 22px #0003}
+.label{color:var(--muted);font-size:13px}
+.value{font-size:28px;font-weight:bold;color:var(--cyan);margin:12px 0 4px;overflow-wrap:anywhere}
+.unit{font-size:11px;color:var(--muted)}
+.section{margin:22px 0 12px;font-size:18px}
+.alert{font-size:20px;font-weight:bold}
+.normal{color:#5ee0a0}.warning{color:#ffca62}.danger{color:#ff7272}
+.chartbox{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:16px;margin-top:18px}
+canvas{width:100%;height:260px;display:block}
+.note{color:var(--muted);font-size:12px;line-height:1.5;margin-top:18px}
+.bar{height:10px;background:#263c55;border-radius:8px;overflow:hidden;margin-top:10px}
+.fill{height:100%;background:linear-gradient(90deg,#38bdf8,#facc15,#fb7185);width:0%}
+@media(max-width:500px){body{padding:12px}.value{font-size:23px}}
+</style>
+</head>
+<body><div class="wrap">
+<header>
+<h1>STAMPEDE DETECTOR</h1>
+<div class="sub">ESP32 NODE 1 · LIVE SENSOR MONITORING</div>
+<div class="top">
+<span class="pill" id="wifi">Wi-Fi: connecting...</span>
+<span class="pill" id="updated">Waiting for readings</span>
+</div>
+</header>
+
+<h2 class="section">Crowd Intensity Index</h2>
+<div class="grid">
+ <div class="card">
+  <div class="label">CII SCORE (%(x100))</div><div class="value" id="cii">--</div>
+  <div class="bar"><div class="fill" id="ciiBar"></div></div>
+  <div class="unit" id="ciiStatus">Calculating...</div>
+ </div>
+ <div class="card"><div class="label">Pressure contribution (P)</div><div class="value" id="p">--</div><div class="unit">Normalized 0–100</div></div>
+ <div class="card"><div class="label">Vibration contribution (V)</div><div class="value" id="v">--</div><div class="unit">Normalized 0–100</div></div>
+ <div class="card"><div class="label">Sound contribution (S)</div><div class="value" id="s">--</div><div class="unit">Normalized 0–100</div></div>
+ <div class="card"><div class="label">Pressure change (dP)</div><div class="value" id="dp">--</div><div class="unit">Change in normalized P</div></div>
+ <div class="card"><div class="label">Vibration change (dV)</div><div class="value" id="dv">--</div><div class="unit">Change in normalized V</div></div>
+</div>
+
+<h2 class="section">Sensor readings</h2>
+<div class="grid">
+ <div class="card"><div class="label">HX711 raw count</div><div class="value" id="raw">--</div><div class="unit">ADC counts · uncalibrated</div></div>
+ <div class="card"><div class="label">Simulated load</div><div class="value" id="kg">--</div><div class="unit">kg · DEMO ONLY</div></div>
+ <div class="card"><div class="label">Acceleration X</div><div class="value" id="ax">--</div><div class="unit">m/s²</div></div>
+ <div class="card"><div class="label">Acceleration Y</div><div class="value" id="ay">--</div><div class="unit">m/s²</div></div>
+ <div class="card"><div class="label">Acceleration Z</div><div class="value" id="az">--</div><div class="unit">m/s²</div></div>
+ <div class="card"><div class="label">Vibration RMS</div><div class="value" id="vib">--</div><div class="unit">m/s²</div></div>
+ <div class="card"><div class="label">Sound level</div><div class="value" id="sound">--</div><div class="unit">dBFS · not calibrated dB SPL</div></div>
+ <div class="card"><div class="label">System alert</div><div class="value alert" id="alert">WAITING</div><div class="unit">Experimental sensor thresholds</div></div>
+</div>
+
+<div class="chartbox">
+ <h2 class="section">Live CII Trend</h2>
+ <canvas id="ciiChart" width="1000" height="260"></canvas>
+ <div class="unit">Last 60 updates · CII score from 0 to 100</div>
+</div>
+<div class="note">
+<strong>Prototype limitations:</strong> Load in kg is simulated and not a measured weight. P is derived from absolute HX711 raw-count change, not calibrated physical pressure. CII inputs are normalized using prototype thresholds and are not validated for real crowd-density measurement or stampede prediction. Sound is dBFS, not calibrated dB SPL.
+</div>
+</div>
+<script>
+const ids=['cii','p','v','s','dp','dv','raw','kg','ax','ay','az','vib','sound','alert'];
+const history=[];
+function fmt(x,n=2){return x===null||x===undefined?'N/A':Number(x).toFixed(n)}
+function drawChart(){
+ const c=document.getElementById('ciiChart'),ctx=c.getContext('2d');
+ const w=c.width,h=c.height,pad=38;
+ ctx.clearRect(0,0,w,h);ctx.font='13px Arial';
+ ctx.strokeStyle='#38516b';ctx.fillStyle='#a9bdd2';ctx.lineWidth=1;
+ [0,25,50,75,100].forEach(v=>{
+  let y=h-pad-(v/100)*(h-2*pad);
+  ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w-10,y);ctx.stroke();
+  ctx.fillText(v,y<20?y+12:y-5,12);
+ });
+ if(history.length<2)return;
+ ctx.strokeStyle='#51c8ff';ctx.lineWidth=3;ctx.beginPath();
+ history.forEach((v,i)=>{
+  let x=pad+i*(w-pad-12)/(59),y=h-pad-(v/100)*(h-2*pad);
+  if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+ });
+ ctx.stroke();
+}
+async function update(){
+ try{
+  const r=await fetch('/api/data');const d=await r.json();
+  document.getElementById('wifi').textContent='Wi-Fi: '+d.wifi;
+  document.getElementById('updated').textContent='Updated: '+d.time;
+  document.getElementById('cii').textContent=fmt(d.cii,1);
+  document.getElementById('p').textContent=fmt(d.p,1);
+  document.getElementById('v').textContent=fmt(d.v,1);
+  document.getElementById('s').textContent=fmt(d.s,1);
+  document.getElementById('dp').textContent=fmt(d.dp,1);
+  document.getElementById('dv').textContent=fmt(d.dv,1);
+  document.getElementById('raw').textContent=d.raw;
+  document.getElementById('kg').textContent=fmt(d.kg,1);
+  document.getElementById('ax').textContent=fmt(d.ax);
+  document.getElementById('ay').textContent=fmt(d.ay);
+  document.getElementById('az').textContent=fmt(d.az);
+  document.getElementById('vib').textContent=fmt(d.vibration,3);
+  document.getElementById('sound').textContent=fmt(d.sound,1);
+  const a=document.getElementById('alert');a.textContent=d.alert;
+  a.className='value alert '+(d.alert==='HIGH'?'danger':'normal');
+  const status=document.getElementById('ciiStatus');
+  status.textContent=d.cii<30?'LOW (prototype)':d.cii<60?'MODERATE (prototype)':'HIGH (prototype)';
+  document.getElementById('ciiBar').style.width=Math.max(0,Math.min(100,d.cii))+'%';
+  if(history.length===0||history[history.length-1]!==d.cii){
+    history.push(d.cii);if(history.length>60)history.shift();drawChart();
+  }
+ }catch(e){document.getElementById('wifi').textContent='Dashboard connection error';}
+}
+setInterval(update,1000);update();
+</script>
+</body></html>
+)HTML";
+
+// ---------------- SENSOR HELPERS --------------------
+bool validLoadReading(long value) {
+  return !(value >= 8380000L || value <= -8380000L);
+}
+
+void initLoadCell() {
+  Serial.println("\nInitializing HX711...");
+  scale.begin(HX_DOUT, HX_SCK);
+  hxOK = scale.wait_ready_timeout(2000);
+  Serial.println(hxOK ? "HX711: CONNECTED" : "HX711: ERROR");
+}
+
+void initAccelerometer() {
+  Serial.println("\nInitializing ADXL345...");
+  Wire.begin(ADXL_SDA, ADXL_SCL);
+  adxlOK = adxl.begin();
+  if (adxlOK) {
+    adxl.setRange(ADXL345_RANGE_4_G);
+    Serial.println("ADXL345: CONNECTED");
+  } else Serial.println("ADXL345: ERROR");
+}
+
+void initMicrophone() {
+  Serial.println("\nInitializing INMP441...");
+  i2s_config_t config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 4,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num = MIC_BCLK,
+    .ws_io_num = MIC_WS,
+    .data_out_num = -1,
+    .data_in_num = MIC_SD
+  };
+  esp_err_t result = i2s_driver_install(I2S_PORT, &config, 0, NULL);
+  if (result != ESP_OK) {
+    micOK = false;
+    Serial.printf("I2S installation error: %d\n", result);
+    return;
+  }
+  result = i2s_set_pin(I2S_PORT, &pins);
+  if (result != ESP_OK) {
+    micOK = false;
+    Serial.printf("I2S pin error: %d\n", result);
+    i2s_driver_uninstall(I2S_PORT);
+    return;
+  }
+  i2s_zero_dma_buffer(I2S_PORT);
+  micOK = true;
+  Serial.println("INMP441: INITIALIZED");
+}
+
+bool readLoadCell(long &value) {
+  if (!hxOK || !scale.wait_ready_timeout(100)) return false;
+  value = scale.read_average(3);
+  return validLoadReading(value);
+}
+
+bool readAccelerometer() {
+  if (!adxlOK) return false;
+  const int samples = 20;
+  double sumSquares = 0;
+  for (int i = 0; i < samples; i++) {
+    sensors_event_t event;
+    adxl.getEvent(&event);
+    ax = event.acceleration.x;
+    ay = event.acceleration.y;
+    az = event.acceleration.z;
+    float magnitude = sqrtf(ax * ax + ay * ay + az * az);
+    float dynamicAcceleration = magnitude - 9.80665f;
+    sumSquares += dynamicAcceleration * dynamicAcceleration;
+    delay(10);
+  }
+  vibrationRMS = sqrtf(sumSquares / samples);
+  return isfinite(ax) && isfinite(ay) && isfinite(az) && isfinite(vibrationRMS);
+}
+
+bool readMicrophone(float &dbfs) {
+  if (!micOK) return false;
+  int32_t samples[SAMPLE_COUNT];
+  size_t bytesRead = 0;
+  esp_err_t result = i2s_read(I2S_PORT, samples, sizeof(samples), &bytesRead, pdMS_TO_TICKS(150));
+  int count = bytesRead / sizeof(int32_t);
+  if (result != ESP_OK || count == 0) return false;
+  double sum = 0, sumSquares = 0;
+  for (int i = 0; i < count; i++) {
+    int32_t sample = samples[i] >> 8;
+    sum += sample;
+    sumSquares += (double)sample * sample;
+  }
+  double mean = sum / count;
+  double variance = sumSquares / count - mean * mean;
+  if (variance < 0) variance = 0;
+  double rms = sqrt(variance);
+  dbfs = (rms <= 0) ? -120.0f : 20.0f * log10(rms / 8388607.0);
+  return isfinite(dbfs);
+}
+
+void calibrateBaselines() {
+  Serial.println("\nKeep load platform unloaded and sensors still for calibration.");
+  if (hxOK) {
+    long total = 0; int valid = 0;
+    for (int i = 0; i < 20; i++) {
+      long value;
+      if (readLoadCell(value)) { total += value; valid++; }
+      delay(100);
+    }
+    if (valid >= 15) {
+      loadBaseline = total / valid; loadBaselineOK = true;
+      Serial.printf("Load baseline: %ld counts\n", loadBaseline);
+    } else Serial.println("Load baseline unavailable.");
+  }
+  if (adxlOK) {
+    double total = 0; int valid = 0;
+    for (int i = 0; i < 10; i++) {
+      if (readAccelerometer()) { total += vibrationRMS; valid++; }
+      delay(100);
+    }
+    if (valid >= 8) {
+      vibrationBaseline = total / valid; accelBaselineOK = true;
+      Serial.printf("Vibration baseline: %.3f m/s^2\n", vibrationBaseline);
+    } else Serial.println("Vibration baseline unavailable.");
+  }
+  if (micOK) {
+    double total = 0; int valid = 0;
+    for (int i = 0; i < 20; i++) {
+      float value;
+      if (readMicrophone(value)) { total += value; valid++; }
+      delay(100);
+    }
+    if (valid >= 15) {
+      soundBaseline = total / valid; micBaselineOK = true;
+      Serial.printf("Sound baseline: %.2f dBFS\n", soundBaseline);
+    } else Serial.println("Sound baseline unavailable.");
+  }
+}
+
+void detectLoad() {
+  long value;
+  if (!readLoadCell(value)) {
+    currentLoadValid = false; loadCount = 0; return;
+  }
+  currentLoad = value; currentLoadValid = true;
+  if (!loadBaselineOK) { loadCount = 0; return; }
+  loadDifference = currentLoad - loadBaseline;
+  if (labs(loadDifference) >= LOAD_THRESHOLD) {
+    loadCount++; loadClearCount = 0;
+    if (loadCount >= REQUIRED_READINGS) loadAlert = true;
+  } else {
+    loadCount = 0;
+    if (loadAlert && ++loadClearCount >= 3) {
+      loadAlert = false; loadClearCount = 0;
+    }
+  }
+}
+
+void detectVibration() {
+  if (!accelBaselineOK || !readAccelerometer()) {
+    vibrationCount = 0; return;
+  }
+  vibrationChange = vibrationRMS - vibrationBaseline;
+  if (vibrationChange >= VIBRATION_THRESHOLD) {
+    vibrationCount++;
+    if (vibrationCount >= REQUIRED_READINGS) vibrationAlert = true;
+    vibrationClearCount = 0;
+  } else {
+    vibrationCount = 0;
+    if (vibrationAlert && ++vibrationClearCount >= 3) {
+      vibrationAlert = false; vibrationClearCount = 0;
+    }
+  }
+}
+
+void detectSound() {
+  float value;
+  if (!micBaselineOK || !readMicrophone(value)) {
+    soundCount = 0; return;
+  }
+  currentSound = value;
+  soundIncrease = currentSound - soundBaseline;
+  bool increased = soundIncrease >= SOUND_THRESHOLD_DB && currentSound >= MIN_SOUND_DBFS;
+  if (increased) {
+    soundCount++;
+    if (soundCount >= REQUIRED_READINGS) {
+      soundAlert = true; soundLastDetected = millis();
+    }
+  } else {
+    soundCount = 0;
+    if (soundAlert && millis() - soundLastDetected >= 2000) soundAlert = false;
+  }
+}
+
+void updateDemoLoad() {
+  if (millis() - lastDemoUpdate < 1000) return;
+  lastDemoUpdate = millis();
+  if (vibrationAlert || (accelBaselineOK && vibrationChange >= VIBRATION_THRESHOLD))
+    demoLoadKg = random(350, 501) / 10.0f;
+  else demoLoadKg = random(0, 350) / 10.0f;
+}
+
+// ---------------- CII CALCULATION --------------------
+float clamp100(float x) {
+  if (!isfinite(x) || x < 0) return 0;
+  if (x > 100) return 100;
+  return x;
+}
+
+void updateCII() {
+  if (millis() - lastCiiUpdate < 1000) return;
+  lastCiiUpdate = millis();
+
+  // Normalized input components, each in range 0..100.
+  P = (currentLoadValid && loadBaselineOK)
+      ? clamp100((float)labs(loadDifference) * 100.0f / (float)LOAD_THRESHOLD) : 0;
+  V = (accelBaselineOK)
+      ? clamp100(fmaxf(0, vibrationChange) * 100.0f / VIBRATION_THRESHOLD) : 0;
+  S = (micBaselineOK)
+      ? clamp100(fmaxf(0, soundIncrease) * 100.0f / SOUND_THRESHOLD_DB) : 0;
+
+  if (!ciiInitialized) {
+    previousP = P; previousV = V; ciiInitialized = true;
+  }
+  dP = clamp100(fabsf(P - previousP));
+  dV = clamp100(fabsf(V - previousV));
+  previousP = P; previousV = V;
+
+  CII = clamp100(0.35f * P + 0.25f * V + 0.20f * S + 0.10f * dP + 0.10f * dV);
+}
+
+// ---------------- WIFI + WEB SERVER -----------------
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("\nConnecting to Wi-Fi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi connected!");
+    Serial.print("Open dashboard at: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWi-Fi connection failed. Check SSID/password and 2.4 GHz Wi-Fi.");
+  }
+}
+
+String jsonNumber(float value, int decimals = 2) {
+  if (!isfinite(value)) return "null";
+  return String(value, decimals);
+}
+
+void handleApi() {
+  String json = "{";
+  json += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED") + "\",";
+  json += "\"time\":\"" + String(millis() / 1000) + " s\",";
+  json += "\"cii\":" + jsonNumber(CII, 2) + ",";
+  json += "\"p\":" + jsonNumber(P, 2) + ",";
+  json += "\"v\":" + jsonNumber(V, 2) + ",";
+  json += "\"s\":" + jsonNumber(S, 2) + ",";
+  json += "\"dp\":" + jsonNumber(dP, 2) + ",";
+  json += "\"dv\":" + jsonNumber(dV, 2) + ",";
+  json += "\"raw\":\"" + String(currentLoadValid ? String(currentLoad) : "N/A") + "\",";
+  json += "\"kg\":" + jsonNumber(demoLoadKg, 1) + ",";
+  json += "\"ax\":" + jsonNumber(adxlOK ? ax : NAN, 2) + ",";
+  json += "\"ay\":" + jsonNumber(adxlOK ? ay : NAN, 2) + ",";
+  json += "\"az\":" + jsonNumber(adxlOK ? az : NAN, 2) + ",";
+  json += "\"vibration\":" + jsonNumber(accelBaselineOK ? vibrationChange : NAN, 3) + ",";
+  json += "\"sound\":" + jsonNumber(micBaselineOK ? currentSound : NAN, 1) + ",";
+  json += "\"alert\":\"" + String((loadAlert || vibrationAlert || soundAlert) ? "HIGH" : "NORMAL") + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", DASHBOARD_HTML);
+  });
+  server.on("/api/data", HTTP_GET, handleApi);
+  server.begin();
+  Serial.println("Web server started on port 80.");
+}
+
+// ---------------- SETUP / LOOP -----------------------
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  randomSeed(esp_random());
+
+  Serial.println("\n========================================");
+  Serial.println(" STAMPEDE DETECTOR - ESP32 NODE 1");
+  Serial.println(" Wi-Fi Dashboard + CII");
+  Serial.println("========================================");
+
+  initLoadCell();
+  initAccelerometer();
+  initMicrophone();
+  calibrateBaselines();
+
+  setupWiFi();
+  if (WiFi.status() == WL_CONNECTED) setupWebServer();
+
+  Serial.println("\nMonitoring started.");
+}
+
+void loop() {
+  detectLoad();
+  detectVibration();
+  detectSound();
+  updateDemoLoad();
+  updateCII();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
+
+  if (millis() - lastDisplay >= 1000) {
+    lastDisplay = millis();
+    Serial.printf("CII=%.1f | P=%.1f V=%.1f S=%.1f dP=%.1f dV=%.1f | Alert=%s\n",
+      CII, P, V, S, dP, dV,
+      (loadAlert || vibrationAlert || soundAlert) ? "HIGH" : "NORMAL");
+  }
+  delay(20);
+}
